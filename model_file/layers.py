@@ -9,8 +9,10 @@ from torch.nn import functional as F
 
 GlobalParams = collections.namedtuple('GlobalParams',
                                       ['batch_norm_momentum', 'batch_norm_epsilon', "image_size", "width_coefficient",
-                                       "depth_divisor", "min_depth"])
-BlockArgs = collections.namedtuple('BlockArgs', ["se_ratio", 'id_skip', ])
+                                       "depth_divisor", "min_depth", "depth_coefficient", "num_classes",
+                                       "dropout_rate", "drop_connect_rate"])
+BlockArgs = collections.namedtuple('BlockArgs', ["se_ratio", 'id_skip', 'input_filters', "expand_ratio", "kernel_size",
+                                                 "stride", "output_filters", "num_repeat"])
 
 
 def round_filters(filters, global_params):
@@ -33,14 +35,38 @@ def round_filters(filters, global_params):
     return int(new_filters)
 
 
+def round_repeats(repeats, global_params):
+    """
+    通过调整子模块的重复次数而达到调整网络整体深度的目的
+
+    :param repeats: b0初始子模块深度
+    :param global_params: 全局参数信息
+    :return: 调整后的模块重复次数
+    """
+    mutiplire = global_params.depth_coefficient
+    if not mutiplire:
+        return repeats
+    return int(math.ceil(mutiplire * repeats))
+
+
 def get_same_padding_conv2d(image_size=None):
+    """
+    在保存ONNX文件时需要传入image_size参数，此处作为选择，在保存ONNX时自动调整
+    :param image_size:
+    :return:
+    """
     if image_size is None:
         return Conv2dDynamicSamePadding
     else:
-        return partial(Conv2dDynamicSamePadding, image_size=image_size)
+        return partial(Conv2dStaticSamePadding, image_size=image_size)  # 此处partial作用位置
+
+
+# return partial(Conv2dS, image_size=image_size)
 
 
 class Conv2dDynamicSamePadding(nn.Conv2d):
+    """动态padding, 此类为nn.Conv2d的子类"""
+
     def __init__(self, input_channels, out_channels, kernel_size, stride=1, dilation=1, groups=1, bias=True):
         super(Conv2dDynamicSamePadding, self).__init__(input_channels, out_channels, kernel_size, stride, 0, dilation,
                                                        groups, bias)
@@ -58,9 +84,54 @@ class Conv2dDynamicSamePadding(nn.Conv2d):
         # 2p = (o - 1) * s + k - i
         pad_h = max((output_h - 1) * self.stride[0] + (kernel_h - 1) * self.dilation[0] + 1 - input_h, 0)
         pad_w = max((output_w - 1) * self.stride[1] + (kernel_w - 1) * self.dilation[1] + 1 - input_w, 0)
+
+        left = pad_w // 2
+        right = pad_w - left
+        top = pad_h // 2
+        bottom = pad_h - top
         if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, [pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2])
+            x = F.pad(x, [left, right, top, bottom])
         return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+
+class Conv2dStaticSamePadding(nn.Module):
+    """静态padding, 此类为nn.Module的子类"""
+
+    def __init__(self, input_channels, output_channels, kernel_size, stride=1, bias=True, groups=1):
+        super(Conv2dStaticSamePadding, self).__init__()
+        # 实例化卷积层
+        self.conv = nn.Conv2d(input_channels, output_channels, kernel_size, stride=stride, bias=bias, groups=groups)
+
+        # 获取卷积层的步长、卷积核尺寸和空洞个数
+        self.stride = self.conv.stride
+        self.kernel_size = self.conv.kernel_size
+        self.dilation = self.conv.dilation
+
+        # 确保获取的步长和卷积核尺寸是一个长度为2的列表
+        if isinstance(self.stride, int):
+            self.stride = [self.stride] * 2
+        elif len(self.stride) == 1:
+            self.stride = [self.stride[0]] * 2
+        if isinstance(self.kernel_size, int):
+            self.kernel_size = [self.kernel_size] * 2
+        elif len(self.kernel_size) == 1:
+            self.kernel_size = [self.kernel_size[0]] * 2
+
+    def forward(self, x):
+        input_h, input_w = x.shape[-2:]
+
+        # (i / s - 1) * s -i + k
+        #
+        extra_h = (math.ceil(input_w / self.stride[1]) - 1) * self.stride[1] - input_w + self.kernel_size[1]
+        extra_w = (math.ceil(input_h / self.stride[0]) - 1) * self.stride[0] - input_h + self.kernel_size[0]
+
+        left = extra_h // 2
+        right = extra_h - left
+        top = extra_w // 2
+        bottom = extra_w - top
+        # pad内部细节已经封装
+        x = F.pad(x, [left, right, top, bottom])
+        return self.conv(x)
 
 
 def efficientnet_params(model_name):
@@ -143,14 +214,19 @@ class BlockDecoder(object):
             if len(splits) >= 2:
                 options[splits[0]] = splits[1]
         assert (('s' in options and len(options['s']) == 1) or (
-                len(options['s']) == 1 and options['s'][0] == options['s'][1]))  # 核对解码后获取的步长是否正确
+                len(options['s']) == 2 and options['s'][0] == options['s'][1]))  # 核对解码后获取的步长是否正确
         return BlockArgs(se_ratio=float(options['se']) if "se" in options else None,
                          id_skip=('noskip' not in block_string),  # 若字符串种不包含'noskip'则返回True表示接入残差结构
-                         )
+                         input_filters=int(options['i']),
+                         expand_ratio=int(options['e']),
+                         kernel_size=int(options['k']),
+                         stride=int(options['s'][0]),
+                         output_filters=int(options['o']),
+                         num_repeat=int(options['r']))
 
 
 def efficientnet(width_coefficient=None, depth_coefficient=None, dropout_rate=0.2, drop_connect_rate=0.2,
-                 image_size=None, numclasses=1000):
+                 image_size=None, num_classes=1000):
     """
     返回需要生成的efficiennet的子模块参数和全局参数
     :param width_coefficient:
@@ -161,7 +237,13 @@ def efficientnet(width_coefficient=None, depth_coefficient=None, dropout_rate=0.
     :param numclasses:
     :return:
     """
-    blocks_args = []  # 包含网络模块信息的字符串列表，可通过BlockDecoder中的内置方法生成
+    # 包含网络模块信息的字符串列表，可通过BlockDecoder中的内置方法生成
+    blocks_args = [
+        'r1_k3_s11_e1_i32_o16_se0.25', 'r2_k3_s22_e6_i16_o24_se0.25',
+        'r2_k5_s22_e6_i24_o40_se0.25', 'r3_k3_s22_e6_i40_o80_se0.25',
+        'r3_k5_s11_e6_i80_o112_se0.25', 'r4_k5_s22_e6_i112_o192_se0.25',
+        'r1_k3_s11_e6_i192_o320_se0.25',
+    ]
     blocks_args = BlockDecoder.decode(blocks_args)
 
     # 全局网络信息
@@ -171,13 +253,16 @@ def efficientnet(width_coefficient=None, depth_coefficient=None, dropout_rate=0.
                                  width_coefficient=width_coefficient,
                                  depth_divisor=8,
                                  min_depth=None,
-                                 )
+                                 depth_coefficient=depth_coefficient,
+                                 num_classes=num_classes,
+                                 dropout_rate=dropout_rate,
+                                 drop_connect_rate=drop_connect_rate)
     return blocks_args, global_params
 
 
 def get_model_params(model_name, other_params):
-    if model_name.startwith('efficientnet'):
-        width_coefficient, depth_coefficient, dropout_rate, image_size = efficientnet_params(model_name)
+    if model_name.startswith('efficientnet'):
+        width_coefficient, depth_coefficient, image_size,dropout_rate  = efficientnet_params(model_name)
         blocks_args, global_params = efficientnet(width_coefficient, depth_coefficient, dropout_rate, image_size)
     else:
         raise NotImplementedError(f"模型名称错误，输入名称为{model_name}")
@@ -186,11 +271,12 @@ def get_model_params(model_name, other_params):
     return blocks_args, global_params
 
 
+# 网络层中的激活函数实现
 class SwishImplementation(torch.autograd.Function):
     @staticmethod
     def forward(ctx, i):
         result = i * torch.sigmoid(i)
-        ctx.save_for_backwatd(i)
+        ctx.save_for_backward(i)
         return result
 
     @staticmethod
@@ -200,6 +286,7 @@ class SwishImplementation(torch.autograd.Function):
         return grad_output * (sigmoid_i * (1 + i * (1 - sigmoid_i)))
 
 
+# 网络层中的激活函数实现
 class MemoryEfficientSwish(nn.Module):
     def forward(self, x):
         return SwishImplementation.apply(x)
@@ -208,3 +295,23 @@ class MemoryEfficientSwish(nn.Module):
 class Swish(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(x)
+
+
+def drop_connect(inputs, p, training):
+    """
+    手动实现drop_out， 通过在最后一层将矩阵部分置为0实现在该模块中的一个dropout
+    :param inputs: 输入的张良
+    :param p: 权重失活比例
+    :param training: 是否是在训练中
+    :return: 修改后的矩阵，已经失活的位置在该矩阵中等于0
+    """
+    if not training:
+        return inputs
+    batch_size = inputs.shape[0]
+    keep_prob = 1 - p
+    random_tensor = keep_prob
+    # torch.rand()从[0, 1]抽取随机数
+    random_tensor += torch.rand([batch_size, 1, 1, 1], dtype=inputs.dtype, device=inputs.device)
+    # torch.floor()对tensor向下取整
+    binary_tensor = torch.floor(random_tensor)
+    return inputs / keep_prob * binary_tensor
