@@ -1,11 +1,66 @@
 import collections
+import math
 import re
+from functools import partial
+
 import torch.nn as nn
-
 import torch
+from torch.nn import functional as F
 
-GlobalParams = collections.namedtuple('GlobalParams', [])
-BlockArgs = collections.namedtuple('BlockArgs', [])
+GlobalParams = collections.namedtuple('GlobalParams',
+                                      ['batch_norm_momentum', 'batch_norm_epsilon', "image_size", "width_coefficient",
+                                       "depth_divisor", "min_depth"])
+BlockArgs = collections.namedtuple('BlockArgs', ["se_ratio", 'id_skip', ])
+
+
+def round_filters(filters, global_params):
+    """
+    每层宽度的自动调整，即调整自动调整卷积核的数目
+    :param filters: 初始卷积核的数目
+    :param global_params: 全局参数信息
+    :return: 调整后的卷积核数目
+    """
+    multiplire = global_params.width_coefficient
+    if not multiplire:
+        return filters
+    divisor = global_params.depth_divisor
+    min_depth = global_params.min_depth
+    filters *= multiplire
+    min_depth = min_depth or divisor
+    new_filters = max(min_depth, int(filters + divisor / 2) // divisor * divisor)
+    if new_filters < 0.9 * filters:
+        new_filters += divisor
+    return int(new_filters)
+
+
+def get_same_padding_conv2d(image_size=None):
+    if image_size is None:
+        return Conv2dDynamicSamePadding
+    else:
+        return partial(Conv2dDynamicSamePadding, image_size=image_size)
+
+
+class Conv2dDynamicSamePadding(nn.Conv2d):
+    def __init__(self, input_channels, out_channels, kernel_size, stride=1, dilation=1, groups=1, bias=True):
+        super(Conv2dDynamicSamePadding, self).__init__(input_channels, out_channels, kernel_size, stride, 0, dilation,
+                                                       groups, bias)
+        self.stride = self.stride if len(self.stride) == 2 else [self.stride[0]] * 2
+
+    def forward(self, x):
+        input_h, input_w = x.size()[-2:]
+        kernel_h, kernel_w = self.weight.size()[-2:]
+        stride_h, stride_w = self.stride
+        # math.ceil返回一个大于或等于传入参数的的最小整数
+        output_h, output_w = math.ceil(input_h / stride_h), math.ceil(input_w / stride_w)
+
+        # o = ((i - k + 2p) / s) + 1 =====> p
+        # kernel_size = (kernel_h - 1) * self.dilation[0] + 1
+        # 2p = (o - 1) * s + k - i
+        pad_h = max((output_h - 1) * self.stride[0] + (kernel_h - 1) * self.dilation[0] + 1 - input_h, 0)
+        pad_w = max((output_w - 1) * self.stride[1] + (kernel_w - 1) * self.dilation[1] + 1 - input_w, 0)
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, [pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2])
+        return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 
 def efficientnet_params(model_name):
@@ -89,7 +144,9 @@ class BlockDecoder(object):
                 options[splits[0]] = splits[1]
         assert (('s' in options and len(options['s']) == 1) or (
                 len(options['s']) == 1 and options['s'][0] == options['s'][1]))  # 核对解码后获取的步长是否正确
-        return BlockArgs()
+        return BlockArgs(se_ratio=float(options['se']) if "se" in options else None,
+                         id_skip=('noskip' not in block_string),  # 若字符串种不包含'noskip'则返回True表示接入残差结构
+                         )
 
 
 def efficientnet(width_coefficient=None, depth_coefficient=None, dropout_rate=0.2, drop_connect_rate=0.2,
@@ -106,7 +163,15 @@ def efficientnet(width_coefficient=None, depth_coefficient=None, dropout_rate=0.
     """
     blocks_args = []  # 包含网络模块信息的字符串列表，可通过BlockDecoder中的内置方法生成
     blocks_args = BlockDecoder.decode(blocks_args)
-    global_params = GlobalParams()  # 全局网络信息
+
+    # 全局网络信息
+    global_params = GlobalParams(batch_norm_momentum=0.99,
+                                 batch_norm_epsilon=1e-3,
+                                 image_size=image_size,
+                                 width_coefficient=width_coefficient,
+                                 depth_divisor=8,
+                                 min_depth=None,
+                                 )
     return blocks_args, global_params
 
 
@@ -143,4 +208,3 @@ class MemoryEfficientSwish(nn.Module):
 class Swish(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(x)
-
