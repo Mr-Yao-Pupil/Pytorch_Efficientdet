@@ -119,6 +119,7 @@ class EfficientNet(nn.Module):
 
             # 第一层网络生成后将步长和输入特征图的层数进行更改
             if self._blocks_args[i].num_repeat > 1:
+                # 替换掉stride使得在除了进行采样时都可以进行残差和大模块之间特征图尺寸不变
                 self._blocks_args[i] = self._blocks_args[i]._replace(input_filters=self._blocks_args[i].output_filters,
                                                                      stride=1)
 
@@ -155,7 +156,7 @@ class EfficientNet(nn.Module):
                 # 按照失活比例获得失活神经元的总数目
                 drop_connect_rate *= float(idx) / len(self._blocks)
             x = block(x, drop_connect_rate=drop_connect_rate)
-
+            print(x.shape)
         # out
         x = self._swish(self._bn1(self._conv_head(x)))
         return x
@@ -202,7 +203,7 @@ class EfficientNet(nn.Module):
 
 if __name__ == '__main__':
     from torchsummary import summary
-    model_name = r"efficientnet-b7"
+    model_name = r"efficientnet-b0"
     image_size = EfficientNet.get_image_size(model_name)
     model = EfficientNet.get_model(model_name, 1000).cuda()
     summary(model, (3, image_size, image_size), device='cuda')

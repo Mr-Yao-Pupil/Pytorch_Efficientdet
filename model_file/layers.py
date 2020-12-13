@@ -262,7 +262,7 @@ def efficientnet(width_coefficient=None, depth_coefficient=None, dropout_rate=0.
 
 def get_model_params(model_name, other_params):
     if model_name.startswith('efficientnet'):
-        width_coefficient, depth_coefficient, image_size,dropout_rate  = efficientnet_params(model_name)
+        width_coefficient, depth_coefficient, image_size, dropout_rate = efficientnet_params(model_name)
         blocks_args, global_params = efficientnet(width_coefficient, depth_coefficient, dropout_rate, image_size)
     else:
         raise NotImplementedError(f"模型名称错误，输入名称为{model_name}")
@@ -315,3 +315,37 @@ def drop_connect(inputs, p, training):
     # torch.floor()对tensor向下取整
     binary_tensor = torch.floor(random_tensor)
     return inputs / keep_prob * binary_tensor
+
+
+class MaxPool2dStaticSamePadding(nn.Module):
+    """自适应pad补图最大池化"""
+
+    def __init__(self, *args, **kwargs):
+        super(MaxPool2dStaticSamePadding, self).__init__()
+        self.pool = nn.MaxPool2d(*args, **kwargs)
+        # 获取池化实例的步长和池化卷积尺寸
+        self.stride = self.pool.stride
+        self.kernel_size = self.pool.kernel_size
+
+        if isinstance(self.stride, int):
+            self.stride = [self.stride] * 2
+        elif len(self.stride) == 1:
+            self.stride = [self.stride[0]] * 2
+        if isinstance(self.kernel_size, int):
+            self.kernel_size = [self.kernel_size] * 2
+        elif len(self.stride) == 1:
+            self.kernel_size = [self.kernel_size[0]] * 2
+
+    def forward(self, x):
+        input_w, input_h = x.shape[-2:]
+
+        extra_h = (math.ceil(input_w / self.stride[1]) - 1) * self.stride[1] - input_w + self.kernel_size[1]
+        extra_w = (math.ceil(input_h / self.stride[0]) - 1) * self.stride[0] - input_h + self.kernel_size[0]
+
+        left = extra_h // 2
+        right = extra_h - left
+        top = extra_w // 2
+        bottom = extra_w - top
+        # pad内部细节已经封装
+        x = F.pad(x, [left, right, top, bottom])
+        return self.pool(x)
