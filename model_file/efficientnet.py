@@ -156,8 +156,6 @@ class EfficientNet(nn.Module):
                 # 按照失活比例获得失活神经元的总数目
                 drop_connect_rate *= float(idx) / len(self._blocks)
             x = block(x, drop_connect_rate=drop_connect_rate)
-            print(x.shape)
-        # out
         x = self._swish(self._bn1(self._conv_head(x)))
         return x
 
