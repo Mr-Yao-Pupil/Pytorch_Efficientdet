@@ -256,3 +256,62 @@ class BiFPN(nn.Module):
             p6_out = self.down_conv6(self.swish(p6_in + p6_td + self.downsample_p6(p5_out)))
             p7_out = self.down_conv6(self.swish(p7_in + self.downsample_p7(p6_out)))
         return p3_out, p4_out, p5_out, p6_out, p7_out
+
+
+class Box_Block(nn.Module):
+    """返回物体框的网络模块"""
+
+    def __init__(self, in_channels, num_anchors, num_layers, onnx_export=False):
+        super(Box_Block, self).__init__()
+        self.num_layers = num_layers
+        self.conv_list = nn.ModuleList(
+            [SeparableConvBlock(in_channels, in_channels, norm=False, activation=False) for i in range(num_layers)])
+        self.bn_list = nn.ModuleList(
+            [nn.ModuleList([nn.BatchNorm2d(in_channels, momentum=0.1, eps=1e-3)]) for i in range(5)])
+        self.header = SeparableConvBlock(in_channels, num_anchors * 4, norm=False, activation=False)
+        self.swish = MemoryEfficientSwish() if not onnx_export else Swish()
+
+    def forwar(self, inputs):
+        feats = []
+        for feat, bn_list in zip(inputs, self.bn_list):
+            for i, bn, conv in zip(range(self.num_layers), bn_list, self.conv_list):
+                feat = self.swish(bn(conv(feat)))
+            feat = self.header(feat)
+            # # 轴排序
+            # feat = feat.permute(0, 2, 3, 1)
+            # # 使用contiguous返回可以使得Tensor view的数据类型
+            # feat = feat.contiguous().view(feat.shape[0], -1, 4)
+            feat = feat.reshape(feat.shape[0], 4, -1)
+            feats.append(feat)
+        feats = torch.cat(feats, dim=2)
+        return feats
+
+
+class Class_Block(nn.Module):
+    """返回物体分类的模块"""
+
+    def __init__(self, in_channels, num_anchors, num_classes, num_layers, onnx_export=False):
+        super(Class_Block, self).__init__()
+        self.num_anchors = num_anchors
+        self.num_classes = num_classes
+        self.num_layers = num_layers
+        self.conv_list = nn.ModuleList(
+            [SeparableConvBlock(in_channels, in_channels, norm=False, activation=False) for i in range(num_layers)])
+        self.bn_list = nn.ModuleList(
+            [nn.ModuleList([nn.BatchNorm2d(in_channels, momentum=0.1, eps=1e-3) for i in range(num_layers)]) for i in
+             range(5)])
+
+        self.header = SeparableConvBlock(in_channels, num_anchors * num_classes, norm=False, activation=False)
+        self.swish = MemoryEfficientSwish() if not onnx_export else Swish()
+
+    def forward(self, inputs):
+        feats = []
+        for feat, bn_list in zip(inputs, self.bn_list):
+            for i, bn, conv in zip(range(self.num_layers), bn_list, self.conv_list):
+                feat = self.swish(bn(conv(feat)))
+            feat = self.header(feat)
+            feat = feat.reshape(feat.shape[0], self.num_anchors, self.num_classes, feat[2], feat[3])
+            feat = feat.reshape(feat[0], self.num_classes, -1)
+            feats.append(feat)
+        feats = torch.cat(feats, dim=2)
+        return feats.sigmoid()
