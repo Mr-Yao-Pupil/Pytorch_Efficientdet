@@ -1,6 +1,8 @@
 import torch.nn as nn
 import torch
 from model_file.layers import Swish, MemoryEfficientSwish, MaxPool2dStaticSamePadding, Conv2dStaticSamePadding
+from model_file.efficientnet import EfficientNet as Main_Model
+from utils.anchors import Anchors
 
 
 class SeparableConvBlock(nn.Module):
@@ -105,8 +107,10 @@ class BiFPN(nn.Module):
 
     def forward(self, inputs):
         if self.attention:
-            # out_p3, out_p4, out_p5, out_p6, out_p7 = \
-            self._forward_fast_attention(inputs)
+            p3_out, p4_out, p5_out, p6_out, p7_out = self._forward_fast_attention(inputs)
+        else:
+            p3_out, p4_out, p5_out, p6_out, p7_out = self._forward(inputs)
+        return p3_out, p4_out, p5_out, p6_out, p7_out
 
     def _forward_fast_attention(self, inputs):
         """ bifpn模块结构示意图
@@ -124,21 +128,21 @@ class BiFPN(nn.Module):
                              |---------------↓ |
             p5_in -------------------------> P3_out -------->
         """
-        p3, p4, p5 = inputs
         if self.first_time:
+            p3, p4, p5 = inputs
             p3_in = self.down_channel_p3(p3)
 
             p4_in_1 = self.down_channel_p4(p4)
             p4_in_2 = self.p4_down_channel_2(p4)
 
-            p5_in_1 = self.down_channel_p4(p5)
-            p5_in_2 = self.p4_down_channel_2(p5)
+            p5_in_1 = self.down_channel_p5(p5)
+            p5_in_2 = self.p5_down_channel_2(p5)
 
             # 原EfficientNet只有P5，通过额外增加下采样层生成p6和p7
             # 增加p6层输出
             p6_in = self._p5_2_p6(p5)
             # 增加p7层输出
-            p7_in = self._p5_2_p6(p6_in)
+            p7_in = self._p6_2_p7(p6_in)
 
             # 用与p6_in和p7_in的注意力模块
             # 生成简单的通道注意力权重
@@ -271,7 +275,7 @@ class Box_Block(nn.Module):
         self.header = SeparableConvBlock(in_channels, num_anchors * 4, norm=False, activation=False)
         self.swish = MemoryEfficientSwish() if not onnx_export else Swish()
 
-    def forwar(self, inputs):
+    def forward(self, inputs):
         feats = []
         for feat, bn_list in zip(inputs, self.bn_list):
             for i, bn, conv in zip(range(self.num_layers), bn_list, self.conv_list):
@@ -310,8 +314,109 @@ class Class_Block(nn.Module):
             for i, bn, conv in zip(range(self.num_layers), bn_list, self.conv_list):
                 feat = self.swish(bn(conv(feat)))
             feat = self.header(feat)
-            feat = feat.reshape(feat.shape[0], self.num_anchors, self.num_classes, feat[2], feat[3])
-            feat = feat.reshape(feat[0], self.num_classes, -1)
+            feat = feat.reshape(feat.shape[0], self.num_anchors, self.num_classes, feat.shape[2], feat.shape[3])
+            feat = feat.reshape(feat.shape[0], self.num_classes, -1)
             feats.append(feat)
         feats = torch.cat(feats, dim=2)
         return feats.sigmoid()
+
+
+class EfficientNet(nn.Module):
+    def __init__(self, phi, load_weight=False):
+        super(EfficientNet, self).__init__()
+        """
+        EfficientNet的网络主干部分
+
+        :param phi: 网络选型b0~b7
+        :param load_weights: 是否加载权重，默认False不加载
+        """
+        main_model = Main_Model.from_name(f'efficientnet-b{phi}', load_weight)
+        del main_model._conv_head
+        del main_model._bn1
+        del main_model._avg_pooling
+        del main_model._dropout
+        del main_model._fc
+        self.main_model = main_model
+
+    def forward(self, inputs):
+        x = self.main_model._swish(self.main_model._bn0(self.main_model._conv_stem(inputs)))
+
+        feature_maps = []
+        last_x = None
+        for idx, block in enumerate(self.main_model._blocks):
+            drop_connect_rate = self.main_model._global_params.drop_connect_rate
+            if drop_connect_rate:
+                drop_connect_rate *= float(idx) / len(self.main_model._blocks)
+            x = block(x, drop_connect_rate=drop_connect_rate)
+
+            if block._depthwise.stride == [2, 2]:
+                feature_maps.append(last_x)
+            elif idx == len(self.main_model._blocks) - 1:
+                feature_maps.append(x)
+            last_x = x
+        del last_x
+        return feature_maps[1:]
+
+
+class EfficientDet_BackBone(nn.Module):
+    def __init__(self, num_classes=80, phi=0, load_weight=False):
+        super(EfficientDet_BackBone, self).__init__()
+        self.phi = phi
+        self.backbone_phi = [0, 1, 2, 3, 4, 5, 6, 6]
+        # self.backbone_phi = [0, 1, 2, 3, 4, 5, 6, 7]
+        self.fpn_num_filters = [64, 88, 112, 160, 224, 288, 384, 384]
+        self.fpn_cell_repeats = [3, 4, 5, 6, 7, 7, 8, 8]
+        self.box_class_repeats = [3, 3, 3, 4, 4, 4, 5, 5]
+        self.anchor_scale = [4., 4., 4., 4., 4., 4., 4., 5.]
+
+        num_anchors = 9
+        # 在著网络输出时，p3-p5的通道数目
+        conv_channel_coef = {0: [40, 112, 320],
+                             1: [40, 112, 320],
+                             2: [48, 120, 352],
+                             3: [48, 136, 384],
+                             4: [56, 160, 448],
+                             5: [64, 176, 512],
+                             6: [72, 200, 576],
+                             7: [72, 200, 576], }
+
+        self.bifpn = nn.Sequential(
+            *[BiFPN(self.fpn_num_filters[self.phi], conv_channel_coef[phi],
+                    True if _ == 0 else False,
+                    attention=True if phi < 6 else False) for _ in range(self.fpn_cell_repeats[phi])])
+
+        self.num_classes = num_classes
+
+        self.regressor = Box_Block(in_channels=self.fpn_num_filters[self.phi], num_anchors=num_anchors,
+                                   num_layers=self.box_class_repeats[self.phi])
+        self.classifier = Class_Block(in_channels=self.fpn_num_filters[self.phi], num_anchors=num_anchors,
+                                      num_layers=self.box_class_repeats[self.phi], num_classes=num_classes)
+        self.anchors = Anchors(anchor_scale=self.anchor_scale[phi])
+        self.bockbone_net = EfficientNet(self.backbone_phi[phi], load_weight=load_weight)
+
+    def freeze_bn(self):
+        """固定BN层的可训练参数"""
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+    def forward(self, inputs):
+        _, p3, p4, p5 = self.bockbone_net(inputs)
+
+        features = self.bifpn((p3, p4, p5))
+
+        # 检测部分
+        regression = self.regressor(features)
+        classification = self.classifier(features)
+        anchors = self.anchors(inputs)
+
+        return features, regression, classification, anchors
+if __name__ == '__main__':
+    model = EfficientDet_BackBone()
+    test_inputs = torch.Tensor(1, 3, 256, 256)
+    out = model(test_inputs)
+    for i in out:
+        try:
+            print(i.shape)
+        except:
+            print(i[0].shape, i[1].shape)

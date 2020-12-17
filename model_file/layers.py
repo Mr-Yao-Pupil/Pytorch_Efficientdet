@@ -220,7 +220,7 @@ class BlockDecoder(object):
                          input_filters=int(options['i']),
                          expand_ratio=int(options['e']),
                          kernel_size=int(options['k']),
-                         stride=int(options['s'][0]),
+                         stride=[int(options['s'][0])],
                          output_filters=int(options['o']),
                          num_repeat=int(options['r']))
 

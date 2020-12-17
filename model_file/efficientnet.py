@@ -33,7 +33,7 @@ class Main_Conv_Block(nn.Module):
         # 深度可分离卷积
         k = self._block_args.kernel_size
         s = self._block_args.stride
-        self._depthwish = Conv2d(oup, oup, groups=oup, kernel_size=k, stride=s, bias=False)
+        self._depthwise = Conv2d(oup, oup, groups=oup, kernel_size=k, stride=s, bias=False)
         self._bn1 = nn.BatchNorm2d(oup, momentum=self._bn_mom, eps=self._bn_eps)
 
         # (通道)注意力机制模块组， 线进行通道数的收缩后再扩张
@@ -56,7 +56,7 @@ class Main_Conv_Block(nn.Module):
             x = self._swish(self._bn0(self._expand_conv(inputs)))
 
         # 深度可分离卷积模块
-        x = self._swish(self._bn1(self._depthwish(x)))
+        x = self._swish(self._bn1(self._depthwise(x)))
 
         # 通道注意力机制
         if self.has_se:
